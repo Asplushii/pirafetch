@@ -1,129 +1,145 @@
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdlib.h> 
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <errno.h>
-#include <ctype.h>
-#define PURPLE "\033[0;35m"
-#define RESET "\033[0m"
-#define MAX_PATH_LEN 256
-#define CONFIG_DIR_PATH "/home/%s/.config/pira"
-#define CONFIG_FILE_PATH "/home/%s/.config/pira/config.conf"
+#include <pthread.h>
 
-void executeCommand(const char * command, char ** output);
-void createConfigFile();
-void parseConfigFile();
+#define MAX_LENGTH 128
+#define NUM_COMMANDS 19
+#define THREAD_POOL_SIZE 12
 
-int count_installed_packages();
+typedef struct {
+    const char *key;
+    char value[MAX_LENGTH];
+} CacheEntry;
 
-void executeCommand(const char * command, char ** output) {
-  FILE * fp = popen(command, "r");
-  if (fp) {
-    char buffer[MAX_PATH_LEN];
-    size_t len = 0, output_size = MAX_PATH_LEN;
-    * output = malloc(output_size);
-    if (! * output) {
-      perror("malloc");
-      exit(EXIT_FAILURE);
-    }
-    while (fgets(buffer, sizeof(buffer), fp)) {
-      size_t buffer_len = strlen(buffer);
-      if (len + buffer_len + 1 >= output_size && ( * output = realloc( * output, output_size *= 2)) == NULL) {
-        perror("realloc");
-        exit(EXIT_FAILURE);
-      }
-      strcpy( * output + len, buffer);
-      len += buffer_len;
-    }
-  }
-}
+CacheEntry cache[5]; 
+int cache_count = 0;
 
-void createConfigFile() {
-  const char * config_content = "info \"OS:\" distro\ninfo \"Kernel:\" kernel\ninfo \"Hostname:\" hostname\ninfo \"Model:\" model\ninfo \"CPU:\" cpu\ninfo \"GPU:\" gpu\ninfo \"Packages:\" packages\ninfo \"Battery:\" battery\n";
-  char config_dir[MAX_PATH_LEN], config_file[MAX_PATH_LEN];
-  sprintf(config_dir, CONFIG_DIR_PATH, getlogin());
-  sprintf(config_file, CONFIG_FILE_PATH, getlogin());
-  FILE * fp = fopen(config_file, "w");
-  fp && fputs(config_content, fp) && fclose(fp);
-}
+typedef struct {
+    const char *command;
+    char output[MAX_LENGTH]; 
+} CommandOutput;
 
-void parseConfigFile() {
-  char config_file[MAX_PATH_LEN];
-  sprintf(config_file, CONFIG_FILE_PATH, getlogin());
-  FILE * fp = fopen(config_file, "r");
-  if (fp) {
-    char line[MAX_PATH_LEN];
-    while (fgets(line, sizeof(line), fp)) {
-      char * info_type = strtok(line, " ");
-      if (info_type) {
-        char * info_label = strtok(NULL, "\"\n");
-        char * info_function = strtok(NULL, "\n");
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+int command_index = 0;
 
-        if (info_label) {
-          int len = strlen(info_label);
-          if (info_label[0] == '"' && info_label[len - 1] == '"') {
-            printf("%s%s%s\n", PURPLE, info_label + 1, RESET);
-          } else {
-            printf("%s ", info_label);
-          }
+char* find_in_cache(const char *key) {
+    for (int i = 0; i < cache_count; i++) {
+        if (strcmp(cache[i].key, key) == 0) {
+            return cache[i].value;
         }
-        if (info_function) {
-          char * trimmed_function = info_function;
-          while ( * trimmed_function && isspace( * trimmed_function)) trimmed_function++;
-          char * end = trimmed_function + strlen(trimmed_function) - 1;
-          while (end > trimmed_function && isspace( * end)) end--;
-          end[1] = '\0';
-
-          char * output = NULL;
-          if (strcmp(info_type, "info") == 0 || strlen(info_type) == 0) {
-            if (strcmp(trimmed_function, "distro") == 0) {
-              executeCommand("cat /etc/os-release | grep '^PRETTY_NAME=' | awk -F '\"' '{print $2}' || echo $(grep '^NAME=' /etc/os-release | awk -F '\"' '{print $2}')", & output);
-            } else if (strcmp(trimmed_function, "kernel") == 0) {
-              executeCommand("uname -r", & output);
-            } else if (strcmp(trimmed_function, "hostname") == 0) {
-              executeCommand("hostname", & output);
-            } else if (strcmp(trimmed_function, "model") == 0) {
-              executeCommand("cat /sys/devices/virtual/dmi/id/product_name", & output);
-            } else if (strcmp(trimmed_function, "cpu") == 0) {
-              executeCommand("lscpu | grep 'Model name' | cut -d':' -f2 | sed 's/^ *//'", & output);
-            } else if (strcmp(trimmed_function, "gpu") == 0) {
-              executeCommand("lspci | grep -i 'vga compatible controller' | sed -n 's/.*\\[\\(.*\\)\\].*/\\1/p'", & output);
-            } else if (strcmp(trimmed_function, "packages") == 0) {
-              char package_count[10];
-              snprintf(package_count, sizeof(package_count), "%d\n", count_installed_packages());
-              output = strdup(package_count);
-            } else if (strcmp(trimmed_function, "battery") == 0) {
-              executeCommand("upower -i $(upower -e | grep BAT) | awk '/percentage:/ {print $2}'", & output);
-            }
-            if (output != NULL) {
-              printf("%s%s%s\n", PURPLE, output, RESET);
-              free(output);
-            }
-          }
-        }
-      }
     }
-    fclose(fp);
-  }
+    return NULL;
 }
 
-int count_installed_packages() {
-  FILE * fp = popen("pacman -Qq | wc -l", "r");
-  int count = fp ? (fscanf(fp, "%d", & count), pclose(fp), count) : 0;
-  return count;
+void add_to_cache(const char *key, const char *value) {
+    if (cache_count < sizeof(cache)/sizeof(CacheEntry)) {
+        cache[cache_count].key = strdup(key); 
+        strncpy(cache[cache_count].value, value, MAX_LENGTH);
+        cache_count++;
+    }
+}
+
+void *execute_command(void *arg) {
+    while (1) {
+        pthread_mutex_lock(&mutex);
+        int index = command_index++;
+        pthread_mutex_unlock(&mutex);
+
+        if (index >= NUM_COMMANDS) {
+            break; 
+        }
+
+        CommandOutput *cmd = &((CommandOutput *)arg)[index];
+        const char *cached_output = find_in_cache(cmd->command);
+        if (cached_output != NULL) {
+            strcpy(cmd->output, cached_output);
+            continue;
+        }
+
+        FILE *fp = popen(cmd->command, "r");
+        if (fp == NULL) {
+            perror("Error executing command");
+            pthread_exit(NULL);
+        }
+
+        char *fgets_ret;
+        char *output = cmd->output;
+
+        do {
+            fgets_ret = fgets(output, MAX_LENGTH, fp);
+            if (fgets_ret != NULL) {
+                size_t len = strlen(output);
+                if (len > 0 && output[len - 1] == '\n') {
+                    output[len - 1] = '\0';
+                }
+            }
+        } while (fgets_ret != NULL && (!feof(fp)));
+
+        add_to_cache(cmd->command, cmd->output);
+
+        pclose(fp); 
+    }
+
+    pthread_exit(NULL);
+}
+
+void print_info(const char *label, const char *output) {
+    printf("\033[1;32m%s\033[0m: %s\n", label, output);
 }
 
 int main() {
-  char config_dir[MAX_PATH_LEN], config_file[MAX_PATH_LEN];
-  sprintf(config_dir, CONFIG_DIR_PATH, getlogin());
-  struct stat st;
-  if (stat(config_dir, & st) == -1 && mkdir(config_dir, 0777) == -1) {
-    perror("mkdir");
-    exit(EXIT_FAILURE);
-  }
-  sprintf(config_file, CONFIG_FILE_PATH, getlogin());
-  if (access(config_file, F_OK) == -1) createConfigFile();
-  parseConfigFile();
-  return 0;
+
+    const char *commands[NUM_COMMANDS] = {
+        "sed -n 's/^NAME=\"\\(.*\\)\"/\\1/p' /etc/os-release", 
+        "hostnamectl | awk '/Static hostname/{print $3}'", 
+        "uname -r", 
+        "uptime -p | sed 's/up //'", 
+        "pacman -Qq | wc -l",
+        "basename $SHELL", 
+        "xdpyinfo | awk '/dimensions:/{print $2}'", 
+        "echo $XDG_CURRENT_DESKTOP", 
+        "gsettings get org.gnome.desktop.interface gtk-theme | tr -d \"'\"", 
+        "gsettings get org.gnome.desktop.interface icon-theme | tr -d \"'\"", 
+        "gsettings get org.gnome.desktop.interface cursor-theme | tr -d \"'\"", 
+        "fc-match :family | awk -F '\"' '{print $2}'", 
+        "echo $TERM", 
+        "lscpu | awk -F': +' '/Model name/{print $2}'", 
+        "lspci | awk '/VGA compatible controller/{gsub(/.*\\[|\\].*/, \"\", $0); print}'", 
+        "free -h | awk '/^Mem/{print $3\" / \"$2\" (\"int(($3/$2)*100)\"%)\"}'", 
+        "df -h / | awk 'NR==2{print $3\" / \"$2\" (\"$5\")\"}'", 
+        "ip addr show wlan0 | awk '/inet /{print $2}'", 
+        "acpi -b | grep -Eo '[0-9]+%'" 
+    };
+
+    const char *labels[NUM_COMMANDS] = {
+        "OS", "Host", "Kernel", "Uptime", "Packages (pacman)", "Shell", "Display", 
+        "WM/DE", "Theme (GTK)", "Icons (GTK)", "Cursor (GTK)", "Font", "Terminal", 
+        "CPU", "GPU", "Memory", "Disk (/)", "Local IP", "Battery"
+    };
+
+    pthread_t threads[THREAD_POOL_SIZE];
+    CommandOutput outputs[NUM_COMMANDS];
+
+    for (int i = 0; i < NUM_COMMANDS; i++) {
+        outputs[i].command = commands[i];
+    }
+
+    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+        pthread_create(&threads[i], NULL, execute_command, (void *)outputs);
+    }
+
+    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    for (int i = 0; i < NUM_COMMANDS; i++) {
+        print_info(labels[i], outputs[i].output);
+    }
+
+    for (int i = 0; i < cache_count; i++) {
+        free((void*)cache[i].key);
+    }
+
+    return 0;
 }
